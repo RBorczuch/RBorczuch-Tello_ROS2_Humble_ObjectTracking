@@ -1,12 +1,10 @@
-# Copyright 2025 Google LLC.
-# SPDX-License-Identifier: Apache-2.0
 
 import rclpy
 from rclpy.node import Node
 import cv2
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
-from tello_ros2_object_tracking import TrackedObject # Niestandardowy komunikat
+from tello_ros2_object_tracking.msg import TrackedObject # Niestandardowy komunikat
 
 # Poniższy kod jest adaptacją oryginalnych plików process_video.py i tracking_data.py
 # zintegrowaną w jeden samodzielny węzeł ROS2.

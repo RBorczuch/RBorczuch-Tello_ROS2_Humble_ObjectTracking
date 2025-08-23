@@ -1,12 +1,11 @@
-# Copyright 2025 Google LLC.
-# SPDX-License-Identifier: Apache-2.0
+
 
 import rclpy
 from rclpy.node import Node
 import time
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String
-from tello_ros2_object_tracking import TrackedObject
+from tello_ros2_object_tracking.msg import TrackedObject
 from .PID import PIDController
 
 # Importy do obsługi terminala bez zewnętrznych bibliotek
