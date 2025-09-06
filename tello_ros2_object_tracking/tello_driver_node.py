@@ -3,221 +3,189 @@ from rclpy.node import Node
 from djitellopy import Tello
 import cv2
 from cv_bridge import CvBridge
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, Imu, BatteryState, Temperature
 from geometry_msgs.msg import Twist
-from std_msgs.msg import String
-from tello_ros2_object_tracking.msg import TelloStatus
+from std_msgs.msg import String, Int16
 import time
+import threading
+import math
+import numpy as np
+
+def euler_to_quaternion(yaw, pitch, roll):
+    """ Konwertuje kąty Eulera (w radianach) na kwaternion. """
+    cy = math.cos(yaw * 0.5)
+    sy = math.sin(yaw * 0.5)
+    cp = math.cos(pitch * 0.5)
+    sp = math.sin(pitch * 0.5)
+    cr = math.cos(roll * 0.5)
+    sr = math.sin(roll * 0.5)
+    q = [0] * 4
+    q[0] = cy * cp * sr - sy * sp * cr  # x
+    q[1] = sy * cp * sr + cy * sp * cr  # y
+    q[2] = sy * cp * cr - cy * sp * sr  # z
+    q[3] = cy * cp * cr + sy * sp * sr  # w
+    return q
 
 class TelloDriverNode(Node):
     def __init__(self):
         super().__init__('tello_driver')
-        self.get_logger().info("Inicjalizacja węzła Tello Driver...")
+        self.get_logger().info("Inicjalizacja zoptymalizowanego węzła Tello Driver...")
 
+        # --- Połączenie z dronem ---
         self.tello = Tello()
+        self.tello.connect()
+        self.get_logger().info(f"Bateria: {self.tello.get_battery()}%")
+        self.tello.streamon()
+        self.get_logger().info("Strumień wideo włączony.")
+        
         self.bridge = CvBridge()
+        
+        # --- Wydawcy (Publishers) ---
+        # Dane wysokiej częstotliwości
+        self.pub_image_raw = self.create_publisher(Image, 'image_raw', 10)
+        self.pub_imu = self.create_publisher(Imu, 'tello/imu', 10)
+        self.pub_tof = self.create_publisher(Int16, 'tello/tof', 10)
+        # Dane niskiej częstotliwości
+        self.pub_battery = self.create_publisher(BatteryState, 'tello/battery', 10)
+        self.pub_temperature = self.create_publisher(Temperature, 'tello/temperature', 10)
+        
+        # --- Subskrybenci (Subscribers) ---
+        self.create_subscription(Twist, 'tello/cmd_vel', self.cmd_vel_callback, 10)
+        self.create_subscription(String, 'tello/control', self.control_callback, 10)
 
-        # Inicjalizacja drona
-        try:
-            self.tello.connect()
-            self.get_logger().info(f"Bateria: {self.tello.get_battery()}%")
-            self.tello.streamon()
-            self.get_logger().info("Strumień wideo włączony.")
-        except Exception as e:
-            self.get_logger().error(f"Nie udało się zainicjalizować Tello: {e}")
-            rclpy.shutdown()
-            return
+        # --- Wątki do pobierania danych ---
+        self.is_running = True
+        self.state_lock = threading.Lock()
+        self.current_state = {}
 
-        # Wydawcy
-        self.image_publisher = self.create_publisher(Image, 'image_raw', 10)
-        self.status_publisher = self.create_publisher(TelloStatus, 'tello/status', 10)
+        self.video_thread = threading.Thread(target=self._video_thread_loop)
+        self.fast_telemetry_thread = threading.Thread(target=self._fast_telemetry_loop)
+        self.slow_telemetry_thread = threading.Thread(target=self._slow_telemetry_loop)
+        
+        self.video_thread.start()
+        self.fast_telemetry_thread.start()
+        self.slow_telemetry_thread.start()
 
-        # Subskrybenci
-        self.cmd_vel_subscriber = self.create_subscription(
-            Twist, 'tello/cmd_vel', self.cmd_vel_callback, 10)
-        self.control_subscriber = self.create_subscription(
-            String, 'tello/control', self.control_callback, 10)
-
-        # Timery do publikowania danych
-        self.video_timer = self.create_timer(1/30.0, self.publish_video_frame) # 30 FPS
-        self.status_timer = self.create_timer(0.1, self.publish_status) # 10 Hz
-
-        self.get_logger().info("Węzeł Tello Driver jest gotowy.")
+        self.get_logger().info("Węzeł Tello Driver jest gotowy. Wątki danych uruchomione.")
 
     def cmd_vel_callback(self, msg):
-        # Komunikaty Twist: linear.x (przód/tył), linear.y (lewo/prawo), linear.z (góra/dół), angular.z (obrót)
-        # Tello: send_rc_control(lewo_prawo, przód_tył, góra_dół, obrót)
         self.tello.send_rc_control(
-            int(msg.linear.y),
-            int(msg.linear.x),
-            int(msg.linear.z),
-            int(msg.angular.z)
+            int(msg.linear.y), int(msg.linear.x),
+            int(msg.linear.z), int(msg.angular.z)
         )
 
     def control_callback(self, msg):
-        if msg.data == 'takeoff':
-            self.get_logger().info("Startowanie...")
-            self.tello.takeoff()
-        elif msg.data == 'land':
-            self.get_logger().info("Lądowanie...")
-            self.tello.land()
+        if msg.data == 'takeoff': self.tello.takeoff()
+        elif msg.data == 'land': self.tello.land()
 
-    def publish_video_frame(self):
+    def _video_thread_loop(self):
+        """ Pętla wątku wideo, działa z maksymalną możliwą prędkością. """
         frame_read = self.tello.get_frame_read()
-        if frame_read.frame is not None:
-            # Tello zwraca klatki w formacie RGB
+        while self.is_running:
             frame = frame_read.frame
-            # Konwertuj do wiadomości ROS i opublikuj
-            ros_image = self.bridge.cv2_to_imgmsg(frame, "rgb8")
-            ros_image.header.stamp = self.get_clock().now().to_msg()
-            self.image_publisher.publish(ros_image)
+            if frame is not None:
+                ros_image = self.bridge.cv2_to_imgmsg(frame, "rgb8")
+                ros_image.header.stamp = self.get_clock().now().to_msg()
+                self.pub_image_raw.publish(ros_image)
+            time.sleep(1.0 / 30.0) # Ograniczenie do ~30 FPS
 
-    def publish_status(self):
-        try:
-            state = self.tello.get_current_state()
-            status_msg = TelloStatus()
-            status_msg.battery = int(state.get('bat', 0))
-            status_msg.temperature_low = int(state.get('templ', 0))
-            status_msg.temperature_high = int(state.get('temph', 0))
-            status_msg.flight_time = int(state.get('time', 0))
-            status_msg.barometer = float(state.get('baro', 0.0))
-            status_msg.pitch = int(state.get('pitch', 0))
-            status_msg.roll = int(state.get('roll', 0))
-            status_msg.yaw = int(state.get('yaw', 0))
-            status_msg.vgx = int(state.get('vgx', 0))
-            status_msg.vgy = int(state.get('vgy', 0))
-            status_msg.vgz = int(state.get('vgz', 0))
-            status_msg.tof_distance = int(state.get('tof', 0))
-            status_msg.height = int(state.get('h', 0))
-            status_msg.agx = float(state.get('agx', 0.0))
-            status_msg.agy = float(state.get('agy', 0.0))
-            status_msg.agz = float(state.get('agz', 0.0))
-            
-            # Wi-Fi jest osobnym zapytaniem
-            # status_msg.wifi_snr = int(self.tello.query_wifi_signal_noise_ratio())
-            
-            self.status_publisher.publish(status_msg)
-        except Exception as e:
-            self.get_logger().warn(f"Nie udało się pobrać statusu Tello: {e}")
+    def _fast_telemetry_loop(self):
+        """ Pętla wątku telemetrii szybkiej, działa z częstotliwością ~10 Hz. """
+        while self.is_running:
+            try:
+                # Pobierz cały stan naraz - to jest bardziej wydajne
+                state = self.tello.get_current_state()
+                with self.state_lock:
+                    self.current_state = state
+
+                # --- Publikacja danych IMU ---
+                imu_msg = Imu()
+                imu_msg.header.stamp = self.get_clock().now().to_msg()
+                imu_msg.header.frame_id = "tello_imu_link" # Można dostosować
+                
+                # Kwaternion orientacji
+                # djitellopy zwraca kąty w stopniach
+                deg_to_rad = math.pi / 180.0
+                q = euler_to_quaternion(
+                    state['yaw'] * deg_to_rad,
+                    state['pitch'] * deg_to_rad,
+                    state['roll'] * deg_to_rad
+                )
+                imu_msg.orientation.x = q[0]
+                imu_msg.orientation.y = q[1]
+                imu_msg.orientation.z = q[2]
+                imu_msg.orientation.w = q[3]
+
+                # Przyspieszenie liniowe (w m/s^2)
+                # djitellopy zwraca w 'g' * 100, więc dzielimy przez 100 i mnożymy przez 9.81
+                g = 9.80665
+                imu_msg.linear_acceleration.x = state['agx'] * g / 1000.0
+                imu_msg.linear_acceleration.y = state['agy'] * g / 1000.0
+                imu_msg.linear_acceleration.z = state['agz'] * g / 1000.0
+                self.pub_imu.publish(imu_msg)
+
+                # --- Publikacja danych ToF ---
+                tof_msg = Int16(data=int(state['tof']))
+                self.pub_tof.publish(tof_msg)
+
+            except Exception as e:
+                self.get_logger().warn(f"Błąd w pętli szybkiej telemetrii: {e}")
+
+            time.sleep(1.0 / 10.0) # Celuj w 10 Hz
+
+    def _slow_telemetry_loop(self):
+        """ Pętla wątku telemetrii wolnej, działa z częstotliwością ~1 Hz. """
+        while self.is_running:
+            with self.state_lock:
+                state = self.current_state.copy()
+
+            if not state: # Jeśli stan nie został jeszcze pobrany
+                time.sleep(1.0)
+                continue
+
+            try:
+                # --- Publikacja stanu baterii ---
+                battery_msg = BatteryState()
+                battery_msg.header.stamp = self.get_clock().now().to_msg()
+                battery_msg.percentage = float(state['bat'])
+                battery_msg.present = True
+                self.pub_battery.publish(battery_msg)
+
+                # --- Publikacja temperatury ---
+                temp_msg = Temperature()
+                temp_msg.header.stamp = self.get_clock().now().to_msg()
+                # Używamy średniej z najniższej i najwyższej temperatury
+                temp_avg = (state['templ'] + state['temph']) / 2.0
+                temp_msg.temperature = temp_avg
+                self.pub_temperature.publish(temp_msg)
+
+            except Exception as e:
+                self.get_logger().warn(f"Błąd w pętli wolnej telemetrii: {e}")
+
+            time.sleep(1.0) # Celuj w 1 Hz
 
     def on_shutdown(self):
         self.get_logger().info("Zamykanie węzła Tello Driver...")
-        try:
-            if self.tello.is_flying:
-                self.tello.land()
-        except Exception as e:
-            self.get_logger().warn(f"Nie udało się wylądować: {e}")
-        finally:
-            self.tello.streamoff()
-            self.tello.end()
+        self.is_running = False
+        self.video_thread.join(timeout=2)
+        self.fast_telemetry_thread.join(timeout=2)
+        self.slow_telemetry_thread.join(timeout=2)
+        
+        if self.tello.is_flying: self.tello.land()
+        self.tello.streamoff()
+        self.tello.end()
 
 def main(args=None):
     rclpy.init(args=args)
     tello_driver_node = TelloDriverNode()
     try:
         rclpy.spin(tello_driver_node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
     finally:
         tello_driver_node.on_shutdown()
         tello_driver_node.destroy_node()
         rclpy.shutdown()
-
-if __name__ == '__main__':
-    main()```
-
-**Plik: `tello_ros2_object_tracking/video_processor_node.py`**
-Ten węzeł subskrybuje surowy obraz, przetwarza go i publikuje dane śledzenia oraz przetworzony obraz.
-
-```python
-import rclpy
-from rclpy.node import Node
-import cv2
-from cv_bridge import CvBridge
-from sensor_msgs.msg import Image
-from tello_ros2_object_tracking.msg import TrackedObject
-import numpy as np
-import math
-import time
-from threading import Lock
-
-# Import oryginalnej logiki z process_video.py
-from .process_video import VitTrack, VideoProcessor
-
-class VideoProcessorNode(VideoProcessor, Node):
-    def __init__(self):
-        # Inicjalizacja węzła ROS2
-        Node.__init__(self, 'video_processor')
-        self.get_logger().info("Inicjalizacja węzła Video Processor...")
-
-        # Inicjalizacja logiki przetwarzania wideo (klasy nadrzędnej)
-        # Tworzymy fałszywy obiekt tracking_data, ponieważ stan jest teraz zarządzany wewnątrz tej klasy
-        class DummyTrackingData:
-            def __init__(self):
-                self.lock = Lock()
-                self.status = "Lost"
-                self.dx = 0; self.dy = 0; self.distance = 0.0; self.angle = 0.0
-                self.score = 0.0; self.roi_height = 0
-                self.control_mode = "Manual"; self.forward_enabled = False
-        
-        VideoProcessor.__init__(self, tracking_data=DummyTrackingData())
-
-        self.bridge = CvBridge()
-
-        # Wydawcy
-        self.processed_image_pub = self.create_publisher(Image, 'object_tracking/image_processed', 10)
-        self.tracking_data_pub = self.create_publisher(TrackedObject, 'object_tracking/data', 10)
-
-        # Subskrybenci
-        self.image_sub = self.create_subscription(
-            Image, 'image_raw', self.image_callback, 10)
-
-        self.get_logger().info("Węzeł Video Processor jest gotowy.")
-
-    def image_callback(self, msg):
-        try:
-            # Konwertuj wiadomość ROS na klatkę OpenCV (BGR)
-            # Tello Driver publikuje jako RGB8
-            cv_frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-        except Exception as e:
-            self.get_logger().error(f"Błąd konwersji obrazu: {e}")
-            return
-
-        # Użyj logiki z oryginalnego pliku do przetworzenia klatki
-        processed_frame = self.process_frame(cv_frame)
-
-        # Opublikuj przetworzony obraz
-        processed_image_msg = self.bridge.cv2_to_imgmsg(processed_frame, "bgr8")
-        processed_image_msg.header.stamp = self.get_clock().now().to_msg()
-        self.processed_image_pub.publish(processed_image_msg)
-        
-        # Opublikuj dane śledzenia
-        tracking_msg = TrackedObject()
-        with self.tracking_data.lock:
-            tracking_msg.status = self.tracking_data.status
-            tracking_msg.dx = float(self.tracking_data.dx)
-            tracking_msg.dy = float(self.tracking_data.dy)
-            tracking_msg.distance = self.tracking_data.distance
-            tracking_msg.angle = self.tracking_data.angle
-            tracking_msg.score = self.tracking_data.score
-            tracking_msg.roi_height = self.tracking_data.roi_height
-        
-        self.tracking_data_pub.publish(tracking_msg)
-
-        # Pokaż okno (oryginalna funkcjonalność)
-        cv2.imshow("Tracking", processed_frame)
-        key = cv2.waitKey(1)
-        if key == 27: # ESC
-             self.get_logger().info("Naciśnięto ESC, zamykanie.")
-             cv2.destroyAllWindows()
-             rclpy.shutdown()
-
-def main(args=None):
-    rclpy.init(args=args)
-    video_processor_node = VideoProcessorNode()
-    rclpy.spin(video_processor_node)
-    video_processor_node.destroy_node()
-    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

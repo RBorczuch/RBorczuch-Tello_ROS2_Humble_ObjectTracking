@@ -1,282 +1,136 @@
-
 import rclpy
 from rclpy.node import Node
 import cv2
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
-from tello_ros2_object_tracking.msg import TrackedObject # Niestandardowy komunikat
-
-# Poniższy kod jest adaptacją oryginalnych plików process_video.py i tracking_data.py
-# zintegrowaną w jeden samodzielny węzeł ROS2.
+from std_msgs.msg import String
+from geometry_msgs.msg import Vector3
 import numpy as np
 import math
 import time
 import threading
 import os
+import datetime
 from threading import Lock
 
 # ==============================================================================
-# SEKCJA 1: Kod zaadaptowany z oryginalnych plików (logika przetwarzania)
+# SEKCJA 1: Logika przetwarzania wideo i śledzenia
 # ==============================================================================
 
-# -----------------------------
-# Globalne stałe
-# -----------------------------
-RESIZED_WIDTH = 480
-RESIZED_HEIGHT = 360
+RESIZED_WIDTH = 960
+RESIZED_HEIGHT = 720
 
+# Stałe
 DEFAULT_ROI_SIZE = 50
 MIN_ROI_SIZE = 25
-DEFAULT_MAX_ROI_SIZE = 200
-
-REID_INTERVAL = 5
-REID_FAILURE_LIMIT = 240
-
-SIFT_UPDATE_SCORE_THRESHOLD = 70
-SIFT_MATCH_RATIO = 0.75
-SIFT_MIN_GOOD_MATCHES = 10
-
+DEFAULT_MAX_ROI_SIZE = 300
+ROI_ADJUST_STEP = 10
 MIN_TRACK_DURATION = 0.5
 MIN_TRACK_SCORE = 0.30
-
-IMG_MARGIN = 10
-
-FONT_SCALE = 0.5
+FONT_SCALE = 0.6
 FONT_THICKNESS = 1
-LINE_SPACING = 20
-
-STATUS_TEXT_POS = (10, 20)
-REID_TEXT_POS = (10, 60)
-CONTROL_MODE_TEXT_POS = (10, 140)
-RECORDING_TEXT_POS = (10, 180)
-
+LINE_SPACING = 25
+STATUS_TEXT_POS = (10, 30)
+RECORDING_TEXT_POS = (10, 200)
 COLOR_WHITE = (255, 255, 255)
 COLOR_GREEN = (0, 255, 0)
 COLOR_YELLOW = (0, 255, 255)
 COLOR_RED = (0, 0, 255)
 COLOR_BLUE = (255, 0, 0)
 
-FPS_TEXT_OFFSET_Y = -10
-
 class TrackingData:
-    """
-    Przechowuje współdzielone wartości śledzenia z blokadą wątku.
-    W kontekście ROS2, jest to wewnętrzna klasa do zarządzania stanem.
-    """
     def __init__(self):
         self.lock = threading.Lock()
         self.status = "Lost"
-        self.dx = 0
-        self.dy = 0
-        self.distance = 0.0
-        self.angle = 0.0
-        self.score = 0.0
-        self.control_mode = "Manual"  # Tryb jest teraz zarządzany przez węzeł kontrolera
-        self.roi_height = 0
-        self.forward_enabled = False
+        self.dx, self.dy = 0, 0
+        self.score, self.roi_height = 0.0, 0
 
 class VitTrack:
-    """
-    Wrapper dla OpenCV TrackerVit.
-    """
-    def __init__(self, model_path, backend_id=0, target_id=0):
-        self.model_path = model_path
-        self.backend_id = backend_id
-        self.target_id = target_id
-
-        self.params = cv2.TrackerVit_Params()
-        self.params.net = self.model_path
-        self.params.backend = self.backend_id
-        self.params.target = self.target_id
-
-        self.model = cv2.TrackerVit_create(self.params)
-
-    def init(self, image, roi):
-        self.model.init(image, roi)
-
+    def __init__(self, model_path):
+        params = cv2.TrackerVit_Params()
+        params.net = model_path
+        self.model = cv2.TrackerVit_create(params)
+    def init(self, image, roi): self.model.init(image, roi)
     def infer(self, image):
         found, bbox = self.model.update(image)
-        score = self.model.getTrackingScore()
-        return found, bbox, score
+        return found, bbox, self.model.getTrackingScore()
 
 class VideoProcessingLogic:
-    """
-    Zawiera całą logikę przetwarzania obrazu z oryginalnej klasy VideoProcessor.
-    Została przemianowana, aby uniknąć konfliktu nazw z węzłem ROS2.
-    """
-    STATUS_TRACKING = "Status: Tracking"
-    STATUS_REID = "Status: Re-identification"
-    STATUS_LOST = "Status: Lost"
-
-    def __init__(self, tracking_data, model_path='vittrack.onnx'):
-        self.tracking_data = tracking_data
+    def __init__(self, model_path):
+        self.tracking_data = TrackingData()
         self.model_path = model_path
-
-        self.frame_lock = Lock()
-        self.frame = None
-
-        self.tracker = None
-        self.tracking_enabled = False
-        self.tracking_start_time = None
-
-        self.mouse_x = 0
-        self.mouse_y = 0
-        self.new_bbox = None
+        self.tracker, self.tracking_enabled, self.tracking_start_time = None, False, None
+        self.mouse_x, self.mouse_y = 0, 0
         self.roi_size = DEFAULT_ROI_SIZE
-        self.min_roi_size = MIN_ROI_SIZE
-        self.max_roi_size = None
+        self.initialization_request = None
+        self.initialization_lock = Lock()
 
-        self.sift_template = None
-        self.reid_interval = REID_INTERVAL
-        self.frame_number = 0
-        self.reid_fail_count = 0
-        self.reid_thread_running = False
-        self.reid_lock = Lock()
-
-        cv2.namedWindow("Tracking", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Tracking", 960, 720)
+    def set_mouse_callback(self):
         cv2.setMouseCallback("Tracking", self._on_mouse)
-
-    def _overlay_status(self, text, pos=STATUS_TEXT_POS):
-        cv2.putText(self.frame, text, pos, cv2.FONT_HERSHEY_SIMPLEX,
-                    FONT_SCALE, COLOR_WHITE, FONT_THICKNESS)
 
     def _on_mouse(self, event, x, y, flags, param):
         self.mouse_x, self.mouse_y = x, y
         if event == cv2.EVENT_LBUTTONDOWN:
-            x1, y1 = x - self.roi_size // 2, y - self.roi_size // 2
-            self.new_bbox = (x1, y1, self.roi_size, self.roi_size)
-            self.tracking_enabled = True
-            self.tracker = VitTrack(self.model_path)
-            with self.frame_lock:
-                if self.frame is not None:
-                    self.tracker.init(self.frame, self.new_bbox)
-                    roi = self.frame[y1:y1 + self.roi_size, x1:x1 + self.roi_size]
-                    if roi.size != 0:
-                        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-                        sift = cv2.SIFT_create()
-                        kp, des = sift.detectAndCompute(gray_roi, None)
-                        self.sift_template = (kp, des, self.new_bbox)
-            self.tracking_start_time = time.time()
-            self.frame_number = 0
-            self.reid_fail_count = 0
+            bbox = (x - self.roi_size // 2, y - self.roi_size // 2, self.roi_size, self.roi_size)
+            with self.initialization_lock:
+                self.initialization_request = bbox
         elif event == cv2.EVENT_RBUTTONDOWN:
             self.tracking_enabled = False
             self.tracker = None
-            self.tracking_start_time = None
-            self.sift_template = None
-        elif event == cv2.EVENT_MOUSEWHEEL:
-            delta_size = 10 if flags > 0 else -10
-            if self.max_roi_size is None: self.max_roi_size = DEFAULT_MAX_ROI_SIZE
-            self.roi_size = max(MIN_ROI_SIZE, min(self.roi_size + delta_size, self.max_roi_size))
+            with self.tracking_data.lock: self.tracking_data.status = "Lost"
 
-    def draw_text(self, img, lines, start_x, start_y, **kwargs):
+    def adjust_roi_size(self, delta):
+        self.roi_size = max(MIN_ROI_SIZE, min(self.roi_size + delta, DEFAULT_MAX_ROI_SIZE))
+
+    def draw_text(self, img, lines, start_x, start_y):
         for i, line in enumerate(lines):
             pos = (start_x, start_y + i * LINE_SPACING)
             cv2.putText(img, line, pos, cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, COLOR_WHITE, FONT_THICKNESS)
 
-    def draw_rectangle(self, img, bbox, color=COLOR_GREEN, thickness=1):
-        x, y, w, h = map(int, bbox)
-        cv2.rectangle(img, (x, y), (x + w, y + h), color, thickness)
-        return x + w // 2, y + h // 2
-
-    def draw_focused_area(self, img, x, y, size, color=COLOR_BLUE, thickness=1):
-        half_size = size // 2
-        x1, y1 = max(0, x - half_size), max(0, y - half_size)
-        x2, y2 = min(img.shape[1], x + half_size), min(img.shape[0], y + half_size)
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
-
-    def calculate_distance_angle(self, dx, dy):
-        dist = math.hypot(dx, dy)
-        angle = math.degrees(math.atan2(dy, dx))
-        return dist, angle + 360 if angle < 0 else angle
-
-    def _run_reid(self, frame):
-        sift = cv2.SIFT_create()
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        kp_frame, des_frame = sift.detectAndCompute(gray_frame, None)
-        success = False
-        if des_frame is not None and self.sift_template and self.sift_template[1] is not None:
-            bf = cv2.BFMatcher()
-            matches = bf.knnMatch(self.sift_template[1], des_frame, k=2)
-            good = [m for m, n in matches if m.distance < SIFT_MATCH_RATIO * n.distance]
-            if len(good) > SIFT_MIN_GOOD_MATCHES:
-                src_pts = np.float32([self.sift_template[0][m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-                dst_pts = np.float32([kp_frame[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-                M, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-                if M is not None:
-                    x, y, w, h = self.sift_template[2]
-                    corners = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
-                    dst = cv2.perspectiveTransform(corners, M)
-                    new_bbox = cv2.boundingRect(dst)
-                    with self.reid_lock:
-                        self.tracker = VitTrack(self.model_path)
-                        self.tracker.init(frame, new_bbox)
-                        self.tracking_enabled = True
-                        self.tracking_start_time = time.time()
-                    success = True
-        self.reid_thread_running = False
-        if success: self.reid_fail_count = 0
-
     def process_frame(self, frame):
-        with self.frame_lock: self.frame = frame
-        img_h, img_w = self.frame.shape[:2]
-        if self.max_roi_size is None: self.max_roi_size = min(img_h, img_w)
-        center_x, center_y = img_w // 2, img_h // 2
-        cv2.circle(self.frame, (center_x, center_y), 2, (0, 0, 255), -1)
-        frame_copy = self.frame.copy()
-
         if self.tracking_enabled and self.tracker is not None:
-            found, bbox, score = self.tracker.infer(frame_copy)
+            found, bbox, score = self.tracker.infer(frame)
             if found:
                 x, y, w, h = map(int, bbox)
-                if w >= img_w - IMG_MARGIN or h >= img_h - IMG_MARGIN:
-                    self._overlay_status(self.STATUS_REID, STATUS_TEXT_POS)
-                    self.tracking_enabled = False; self.tracker = None
-                    with self.tracking_data.lock: self.tracking_data.status = self.STATUS_REID
-                else:
-                    cx, cy = self.draw_rectangle(frame_copy, bbox)
-                    cv2.line(frame_copy, (center_x, center_y), (cx, cy), COLOR_YELLOW, 1)
-                    dx, dy = center_x - cx, cy - center_y
-                    dist, angle = self.calculate_distance_angle(dx, dy)
-                    info = [self.STATUS_TRACKING, f"Score: {score:.2f}", f"dx: {dx}px", f"dy: {dy}px"]
-                    self.draw_text(frame_copy, info, STATUS_TEXT_POS[0], STATUS_TEXT_POS[1])
-                    with self.tracking_data.lock:
-                        self.tracking_data.status = self.STATUS_TRACKING
-                        self.tracking_data.dx, self.tracking_data.dy = dx, dy
-                        self.tracking_data.distance, self.tracking_data.angle = dist, angle
-                        self.tracking_data.score, self.tracking_data.roi_height = score, h
-                    if (time.time() - self.tracking_start_time > MIN_TRACK_DURATION) and (score < MIN_TRACK_SCORE):
-                        self.tracking_enabled = False; self.tracker = None; self.tracking_start_time = None
-                        with self.tracking_data.lock: self.tracking_data.status = self.STATUS_LOST
-            else:
-                self.tracking_enabled = False; self.tracker = None; self.tracking_start_time = None
-                with self.tracking_data.lock: self.tracking_data.status = self.STATUS_LOST
-            self.frame = frame_copy
-            if found and score > SIFT_UPDATE_SCORE_THRESHOLD:
-                x, y, w, h = map(int, bbox)
-                if w > 0 and h > 0:
-                    roi = frame_copy[y:y + h, x:x + w]
-                    if roi.size != 0:
-                        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-                        sift = cv2.SIFT_create()
-                        kp, des = sift.detectAndCompute(gray_roi, None)
-                        self.sift_template = (kp, des, bbox)
+                center_x, center_y = frame.shape[1] // 2, frame.shape[0] // 2
+                cx, cy = x + w // 2, y + h // 2
+                dx, dy = center_x - cx, cy - center_y
+                dist = math.hypot(dx, dy)
+                angle = math.degrees(math.atan2(dy, dx))
+                
+                # ZMIANA: Przywrócono szczegółowe napisy
+                info = [
+                    f"Status: Tracking",
+                    f"Score: {score:.2f}",
+                    f"dx: {dx}px, dy: {dy}px",
+                    f"Dystans: {dist:.1f}px",
+                    f"Kat: {angle:.1f} deg"
+                ]
+                self.draw_text(frame, info, STATUS_TEXT_POS[0], STATUS_TEXT_POS[1])
 
-        if not self.tracking_enabled and self.sift_template is not None:
-            self.frame_number += 1
-            if (self.frame_number % self.reid_interval == 0) and not self.reid_thread_running:
-                self.reid_thread_running = True
-                threading.Thread(target=self._run_reid, args=(self.frame.copy(),)).start()
-                self.reid_fail_count += self.reid_interval
-                with self.tracking_data.lock: self.tracking_data.status = self.STATUS_REID
-                if self.reid_fail_count >= REID_FAILURE_LIMIT:
-                    self.sift_template = None; self.tracking_enabled = False
-                    with self.tracking_data.lock: self.tracking_data.status = self.STATUS_LOST
+                with self.tracking_data.lock:
+                    self.tracking_data.status, self.tracking_data.dx, self.tracking_data.dy = "Tracking", dx, dy
+                    self.tracking_data.score, self.tracking_data.roi_height = score, h
+                
+                cv2.rectangle(frame, (x, y), (x + w, y + h), COLOR_GREEN, 2)
+                cv2.line(frame, (center_x, center_y), (cx, cy), COLOR_YELLOW, 1)
+                
+                if time.time() - self.tracking_start_time > MIN_TRACK_DURATION and score < MIN_TRACK_SCORE:
+                    found = False
+            
+            if not found:
+                self.tracking_enabled = False
+                self.tracker = None
+                with self.tracking_data.lock: self.tracking_data.status = "Lost"
         
-        self.draw_focused_area(self.frame, self.mouse_x, self.mouse_y, self.roi_size)
-        return self.frame
+        # ZMIANA: Dodano wyświetlanie statusu "Lost", gdy nie śledzimy
+        if not self.tracking_enabled:
+            self.draw_text(frame, ["Status: Lost"], STATUS_TEXT_POS[0], STATUS_TEXT_POS[1])
 
+        cv2.circle(frame, (frame.shape[1] // 2, frame.shape[0] // 2), 3, COLOR_RED, -1)
+        cv2.rectangle(frame, (self.mouse_x - self.roi_size//2, self.mouse_y - self.roi_size//2),
+                      (self.mouse_x + self.roi_size//2, self.mouse_y + self.roi_size//2), COLOR_BLUE, 1)
+        return frame
 
 # ==============================================================================
 # SEKCJA 2: Węzeł ROS2
@@ -286,104 +140,159 @@ class VideoProcessorNode(Node):
     def __init__(self):
         super().__init__('video_processor')
         self.get_logger().info("Inicjalizacja węzła Video Processor...")
-
-        # Wczytaj ścieżkę do modelu z parametrów, jeśli istnieje
         self.declare_parameter('model_path', 'vittrack.onnx')
         model_path = self.get_parameter('model_path').get_parameter_value().string_value
-        self.get_logger().info(f"Używanie modelu śledzącego z: {model_path}")
-        
         if not os.path.exists(model_path):
-            self.get_logger().error(f"Plik modelu nie został znaleziony w '{model_path}'! Upewnij się, że znajduje się w odpowiednim katalogu.")
-            rclpy.shutdown()
-            return
-
-        # Utwórz instancję naszej logiki przetwarzania obrazu
-        self.processing_logic = VideoProcessingLogic(
-            tracking_data=TrackingData(),  # Używa wewnętrznej instancji do zarządzania stanem
-            model_path=model_path
-        )
-
+            self.get_logger().error(f"Plik modelu '{model_path}' nie znaleziony!")
+            rclpy.shutdown(); return
+        
+        self.processing_logic = VideoProcessingLogic(model_path=model_path)
         self.bridge = CvBridge()
-
-        # Wydawcy
-        self.processed_image_pub = self.create_publisher(Image, 'object_tracking/image_processed', 10)
-        self.tracking_data_pub = self.create_publisher(TrackedObject, 'object_tracking/data', 10)
-
-        # Subskrybent
+        cv2.namedWindow("Tracking", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Tracking", RESIZED_WIDTH, RESIZED_HEIGHT)
+        self.processing_logic.set_mouse_callback()
+        self.status_pub = self.create_publisher(String, 'object_tracking/status', 10)
+        self.control_error_pub = self.create_publisher(Vector3, 'object_tracking/control_error', 10)
         self.image_sub = self.create_subscription(Image, 'image_raw', self.image_callback, 10)
-
-        # Do obliczania FPS
-        self.start_time = time.time()
-        self.frame_count = 0
-
-        self.get_logger().info("Węzeł Video Processor jest gotowy.")
+        
+        self.latest_frame, self.frame_lock = None, Lock()
+        self.processed_frame, self.processed_frame_lock = None, Lock()
+        self.is_running = True
+        self.frame_count, self.start_time = 0, time.time()
+        self.recording, self.video_writer = False, None
+        self.recordings_folder = "recordings"
+        os.makedirs(self.recordings_folder, exist_ok=True)
+        self.processing_thread = threading.Thread(target=self.processing_loop)
+        self.processing_thread.start()
+        self.display_timer = self.create_timer(1.0 / 60.0, self.display_loop)
+        self.get_logger().info("Węzeł gotowy. Sterowanie odbywa się w oknie 'Tracking'.")
 
     def image_callback(self, msg: Image):
         try:
-            # Węzeł tello_driver publikuje obrazy w formacie RGB8
-            cv_frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-        except Exception as e:
-            self.get_logger().error(f"Błąd konwersji obrazu z ROS na CV2: {e}")
-            return
+            cv_frame = self.bridge.imgmsg_to_cv2(msg, "rgb8")
+            cv_frame_bgr = cv2.cvtColor(cv_frame, cv2.COLOR_RGB2BGR)
+            with self.frame_lock: self.latest_frame = cv_frame_bgr
+        except Exception as e: self.get_logger().error(f"Błąd konwersji obrazu: {e}")
 
-        # Przeskaluj obraz do stałego rozmiaru na potrzeby przetwarzania
-        resized_frame = cv2.resize(cv_frame, (RESIZED_WIDTH, RESIZED_HEIGHT))
+    def processing_loop(self):
+        # ZMIANA: Ustawienie docelowego czasu klatki na 60 FPS
+        target_frame_duration = 1.0 / 60.0
 
-        # Użyj logiki z oryginalnego pliku do przetworzenia klatki
-        processed_frame = self.processing_logic.process_frame(resized_frame)
+        while self.is_running and rclpy.ok():
+            loop_start_time = time.time()
 
-        # --- Opublikuj dane śledzenia ---
-        tracking_msg = TrackedObject()
-        with self.processing_logic.tracking_data.lock:
-            tracking_msg.status = self.processing_logic.tracking_data.status
-            tracking_msg.dx = float(self.processing_logic.tracking_data.dx)
-            tracking_msg.dy = float(self.processing_logic.tracking_data.dy)
-            tracking_msg.distance = self.processing_logic.tracking_data.distance
-            tracking_msg.angle = self.processing_logic.tracking_data.angle
-            tracking_msg.score = self.processing_logic.tracking_data.score
-            tracking_msg.roi_height = self.processing_logic.tracking_data.roi_height
+            bbox_to_init = None
+            with self.processing_logic.initialization_lock:
+                if self.processing_logic.initialization_request:
+                    bbox_to_init = self.processing_logic.initialization_request
+                    self.processing_logic.initialization_request = None
+
+            if bbox_to_init:
+                self.get_logger().info("Inicjalizacja śledzenia w tle...")
+                frame_for_init = None
+                with self.frame_lock:
+                    if self.latest_frame is not None:
+                        frame_for_init = cv2.resize(self.latest_frame.copy(), (RESIZED_WIDTH, RESIZED_HEIGHT))
+                
+                if frame_for_init is not None:
+                    self.processing_logic.tracker = VitTrack(self.processing_logic.model_path)
+                    self.processing_logic.tracker.init(frame_for_init, bbox_to_init)
+                    self.processing_logic.tracking_enabled = True
+                    self.processing_logic.tracking_start_time = time.time()
+                    self.get_logger().info("Inicjalizacja zakończona.")
+                else:
+                    self.get_logger().warn("Brak klatki do inicjalizacji.")
+
+            frame_to_process = None
+            with self.frame_lock:
+                if self.latest_frame is not None:
+                    frame_to_process = self.latest_frame.copy()
+            
+            if frame_to_process is not None:
+                resized = cv2.resize(frame_to_process, (RESIZED_WIDTH, RESIZED_HEIGHT))
+                processed = self.processing_logic.process_frame(resized)
+                
+                self.frame_count += 1
+                elapsed = time.time() - self.start_time
+                fps = self.frame_count / elapsed if elapsed > 0 else 0.0
+                self.processing_logic.draw_text(processed, [f"FPS: {fps:.2f}"], 10, processed.shape[0] - 30)
+                rec_text = f"Nagrywanie: {'ON' if self.recording else 'OFF'} (klawisz 'n')"
+                self.processing_logic.draw_text(processed, [rec_text], RECORDING_TEXT_POS[0], RECORDING_TEXT_POS[1])
+
+                if self.recording and self.video_writer is not None:
+                    self.video_writer.write(processed)
+
+                with self.processing_logic.tracking_data.lock:
+                    status_msg = String(data=self.processing_logic.tracking_data.status)
+                    control_msg = Vector3(
+                        x=float(self.processing_logic.tracking_data.dx),
+                        y=float(self.processing_logic.tracking_data.dy),
+                        z=float(self.processing_logic.tracking_data.roi_height)
+                    )
+                    self.status_pub.publish(status_msg)
+                    self.control_error_pub.publish(control_msg)
+                
+                with self.processed_frame_lock:
+                    self.processed_frame = processed
+            
+            # ZMIANA: Logika ograniczania FPS
+            elapsed_time = time.time() - loop_start_time
+            sleep_time = target_frame_duration - elapsed_time
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    def display_loop(self):
+        frame_to_show = None
+        with self.processed_frame_lock:
+            if self.processed_frame is not None: frame_to_show = self.processed_frame
         
-        self.tracking_data_pub.publish(tracking_msg)
-
-        # --- Dodaj licznik FPS do wyświetlanego obrazu ---
-        self.frame_count += 1
-        elapsed = time.time() - self.start_time
-        fps = self.frame_count / elapsed if elapsed > 0 else 0.0
-        cv2.putText(
-            processed_frame, f"FPS: {fps:.2f}",
-            (10, processed_frame.shape[0] - 10),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_WHITE, 1
-        )
-
-        # --- Opublikuj przetworzony obraz ---
-        try:
-            processed_image_msg = self.bridge.cv2_to_imgmsg(processed_frame, "bgr8")
-            processed_image_msg.header = msg.header  # Zachowaj oryginalny znacznik czasu
-            self.processed_image_pub.publish(processed_image_msg)
-        except Exception as e:
-            self.get_logger().error(f"Błąd konwersji przetworzonego obrazu na komunikat ROS: {e}")
-
-        # --- Wyświetl okno (zachowanie oryginalnej funkcjonalności) ---
-        cv2.imshow("Tracking", processed_frame)
+        if frame_to_show is not None:
+            is_initializing = False
+            with self.processing_logic.initialization_lock:
+                if self.processing_logic.initialization_request is not None: is_initializing = True
+            
+            if is_initializing:
+                 self.processing_logic.draw_text(frame_to_show, ["Inicjalizacja..."], 
+                                                 int(RESIZED_WIDTH/2) - 50, int(RESIZED_HEIGHT/2))
+            cv2.imshow("Tracking", frame_to_show)
+        
         key = cv2.waitKey(1) & 0xFF
-        if key == 27:  # Klawisz ESC
-            self.get_logger().info("Naciśnięto ESC, zamykanie węzła.")
-            self.destroy_node()
-            rclpy.shutdown()
+        if key == 27: self.is_running = False; self.destroy_node()
+        elif key == ord('1'): self.processing_logic.adjust_roi_size(-ROI_ADJUST_STEP)
+        elif key == ord('2'): self.processing_logic.adjust_roi_size(ROI_ADJUST_STEP)
+        elif key == ord('n'): self.toggle_recording()
+
+    def toggle_recording(self):
+        self.recording = not self.recording
+        if self.recording:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = os.path.join(self.recordings_folder, f"tello_{RESIZED_HEIGHT}p_{timestamp}.mp4")
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self.video_writer = cv2.VideoWriter(filename, fourcc, 30.0, (RESIZED_WIDTH, RESIZED_HEIGHT))
+            self.get_logger().info(f"Rozpoczęto nagrywanie: {filename}")
+        else:
+            if self.video_writer is not None:
+                self.video_writer.release()
+                self.video_writer = None
+                self.get_logger().info("Zakończono nagrywanie.")
+
+    def on_shutdown(self):
+        self.is_running = False
+        if hasattr(self, 'processing_thread') and self.processing_thread.is_alive():
+            self.processing_thread.join(timeout=2)
+        if self.video_writer is not None: self.video_writer.release()
+        cv2.destroyAllWindows()
+        self.get_logger().info("Wątek przetwarzania i zasoby OpenCV zwolnione.")
 
 def main(args=None):
     rclpy.init(args=args)
     video_processor_node = VideoProcessorNode()
-    try:
-        rclpy.spin(video_processor_node)
-    except KeyboardInterrupt:
-        pass
+    try: rclpy.spin(video_processor_node)
+    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException): pass
     finally:
-        # Upewnij się, że zasoby są zwalniane przy zamykaniu
-        cv2.destroyAllWindows()
-        if rclpy.ok():
-            video_processor_node.destroy_node()
-            rclpy.shutdown()
+        video_processor_node.on_shutdown()
+        if rclpy.ok(): video_processor_node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
