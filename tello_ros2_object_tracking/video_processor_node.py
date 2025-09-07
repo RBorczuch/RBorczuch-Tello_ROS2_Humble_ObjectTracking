@@ -32,6 +32,7 @@ class VideoProcessorNode(Node):
         self.processing_logic.set_mouse_callback()
         self.status_pub = self.create_publisher(String, 'object_tracking/status', 10)
         self.control_error_pub = self.create_publisher(Vector3, 'object_tracking/control_error', 10)
+        self.tracking_info_pub = self.create_publisher(Vector3, 'object_tracking/info', 10)
         self.image_sub = self.create_subscription(Image, 'image_raw', self._image_callback, 10)
         # NEW: Subscriber for controller state
         self.create_subscription(String, 'tello/control_state', self._control_state_callback, 10)
@@ -130,8 +131,14 @@ class VideoProcessorNode(Node):
                 y=float(self.processing_logic.tracking_data.dy),
                 z=float(self.processing_logic.tracking_data.roi_height)
             )
+            info_msg = Vector3(
+                x=self.processing_logic.tracking_data.distance,
+                y=self.processing_logic.tracking_data.angle,
+                z=self.processing_logic.tracking_data.score
+            )
             self.status_pub.publish(status_msg)
             self.control_error_pub.publish(control_msg)
+            self.tracking_info_pub.publish(info_msg)
     
     def _display_loop(self):
         frame_to_show = None

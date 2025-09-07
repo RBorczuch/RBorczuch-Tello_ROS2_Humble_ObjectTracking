@@ -10,7 +10,6 @@ import sys, select, tty, termios
 import numpy as np
 
 class KeyboardReader:
-    # ... (no changes)
     def __init__(self): self.settings = termios.tcgetattr(sys.stdin)
     def __enter__(self):
         tty.setraw(sys.stdin.fileno())
@@ -22,15 +21,19 @@ class KeyboardReader:
         return None
 
 # --- Constants ---
-# ... (no changes)
 LOOP_SLEEP = 0.05
 MODE_SWITCH_COOLDOWN = 0.3
 ERROR_THRESHOLD = 20
 DEAD_ZONE = 5
+
+# ==========================================================
+# ZMIANA: Przywrócono wartości PID identyczne z działającym kodem referencyjnym.
+# To jest ostateczna i kluczowa poprawka.
+# ==========================================================
 PID_CONFIG = {
-    'yaw': {'kp': 0.25, 'ki': 0.01, 'kd': 0.1},
-    'vertical': {'kp': 0.3, 'ki': 0.01, 'kd': 0.1},
-    'forward': {'kp': 0.4, 'ki': 0.0, 'kd': 0.1, 'setpoint': 120}
+    'yaw':      {'kp': 0.2, 'ki': 0.01, 'kd': 0.0},
+    'vertical': {'kp': 0.2, 'ki': 0.01, 'kd': 0.0},
+    'forward':  {'kp': 0.4, 'ki': 0.0, 'kd': 0.0, 'setpoint': 120}
 }
 VELOCITY_CONFIG = { 'initial': 50, 'min': 10, 'max': 100, 'step': 10 }
 
@@ -40,12 +43,9 @@ class TelloControllerNode(Node):
         self.key_reader = key_reader
         self.cmd_vel_publisher = self.create_publisher(Twist, 'tello/cmd_vel', 10)
         self.control_publisher = self.create_publisher(String, 'tello/control', 10)
-        # NEW: Publisher for the current control state
         self.state_publisher = self.create_publisher(String, 'tello/control_state', 10)
-
         self.create_subscription(String, 'object_tracking/status', self._status_callback, 10)
         self.create_subscription(Vector3, 'object_tracking/control_error', self._control_error_callback, 10)
-
         self.pids = {name: PIDController(**params) for name, params in PID_CONFIG.items()}
         self.velocity = VELOCITY_CONFIG['initial']
         self.last_mode_switch = 0
@@ -53,7 +53,6 @@ class TelloControllerNode(Node):
         self.forward_enabled = False
         self.tracking_status = "Lost"
         self.control_error = None
-
         self.create_timer(LOOP_SLEEP, self._control_loop)
         self._display_controls()
         self.get_logger().info("Tello Controller node is ready.")
@@ -64,40 +63,33 @@ class TelloControllerNode(Node):
     def _control_loop(self):
         key = self.key_reader.read_key()
         if key and self._handle_command_keys(key):
-            self._publish_state() # Publish state on key press
+            self._publish_state()
             return
-
         if self.control_mode == "Manual":
             self._process_manual_control(key)
-        else: # Autonomous mode
-            if key and key.lower() in 'wasdreqf':
+        else:
+            if key and key.lower() in 'wasdrfeq':
                  self._switch_to_manual("Manual input override.")
             else:
                  self._process_autonomous_control()
-        
         self._publish_state()
 
     def _publish_state(self):
-        """Publishes the current control mode and forward-enabled status."""
         state_str = f"{self.control_mode},{self.forward_enabled}"
         self.state_publisher.publish(String(data=state_str))
 
-    # ... (rest of the methods like _process_manual_control, _process_autonomous_control, etc. remain the same as the previous refactored version)
     def _process_manual_control(self, key: str | None):
         cmd = Twist()
         vel = float(self.velocity)
-        
         key_map = {
             'w': ('linear', 'x', 1),  's': ('linear', 'x', -1),
-            'a': ('linear', 'y', 1),  'd': ('linear', 'y', -1),
+            'a': ('linear', 'y', -1), 'd': ('linear', 'y', 1),
             'r': ('linear', 'z', 1),  'f': ('linear', 'z', -1),
-            'q': ('angular', 'z', -1), 'e': ('angular', 'z', 1),
+            'q': ('angular', 'z', -1),'e': ('angular', 'z', 1),
         }
-        
         if key and key.lower() in key_map:
             axis_type, axis_name, sign = key_map[key.lower()]
             setattr(getattr(cmd, axis_type), axis_name, vel * sign)
-            
         self.cmd_vel_publisher.publish(cmd)
 
     def _process_autonomous_control(self):
@@ -107,12 +99,15 @@ class TelloControllerNode(Node):
             
         dx, dy, roi_height = self.control_error.x, self.control_error.y, self.control_error.z
 
-        yaw_vel = -self._calculate_pid_output('yaw', dx, ERROR_THRESHOLD) 
-        z_vel = -self._calculate_pid_output('vertical', dy, ERROR_THRESHOLD)
         x_vel = self._calculate_pid_output('forward', roi_height) if self.forward_enabled else 0.0
+        yaw_vel = self._calculate_pid_output('yaw', dx, ERROR_THRESHOLD)
+        z_vel = self._calculate_pid_output('vertical', dy, ERROR_THRESHOLD)
 
         cmd = Twist()
-        cmd.linear.x, cmd.linear.z, cmd.angular.z = float(x_vel), float(z_vel), float(yaw_vel)
+        cmd.linear.x = float(x_vel)
+        cmd.linear.y = 0.0
+        cmd.linear.z = float(z_vel)
+        cmd.angular.z = float(yaw_vel)
         self.cmd_vel_publisher.publish(cmd)
 
     def _calculate_pid_output(self, pid_key: str, error: float, threshold: float = 0) -> float:
@@ -122,10 +117,8 @@ class TelloControllerNode(Node):
         return self.pids[pid_key].compute(error)
 
     def _handle_command_keys(self, key: str) -> bool:
-        """Handles non-movement keys. Returns True if a key was handled."""
         key_lower = key.lower()
         now = time.time()
-        
         if key_lower in 'tl':
             cmd = 'takeoff' if key_lower == 't' else 'land'
             self.control_publisher.publish(String(data=cmd))
@@ -138,27 +131,25 @@ class TelloControllerNode(Node):
                 self.control_mode = "Autonomous" if self.control_mode == "Manual" else "Manual"
                 self.get_logger().info(f"Switched to {self.control_mode} mode.")
                 self.last_mode_switch = now
-        elif key_lower == 's' and self.control_mode == "Autonomous":
-             if now - self.last_mode_switch > MODE_SWITCH_COOLDOWN:
+        elif key_lower == 'x':
+             if self.control_mode == "Autonomous" and now - self.last_mode_switch > MODE_SWITCH_COOLDOWN:
                 self.forward_enabled = not self.forward_enabled
                 self.get_logger().info(f"Forward movement: {'ENABLED' if self.forward_enabled else 'DISABLED'}")
                 self.last_mode_switch = now
         elif key == '\x03' or key_lower == 'p':
             self.get_logger().info("Shutdown requested.")
-            self.cmd_vel_publisher.publish(Twist()) # Stop drone before exit
+            self.cmd_vel_publisher.publish(Twist())
             rclpy.shutdown()
-        else:
-            return False # No relevant key was pressed
+        else: return False
         return True
 
     def _switch_to_manual(self, reason: str):
         if self.control_mode == "Autonomous":
             self.control_mode = "Manual"
             self.get_logger().warn(f"Switching to Manual mode: {reason}")
-            self.cmd_vel_publisher.publish(Twist()) # Stop all movement
+            self.cmd_vel_publisher.publish(Twist())
     
     def _display_controls(self):
-        # ... (no changes)
         self.get_logger().info(
             "\n" + "="*40 +
             "\n Tello Controller Interface" +
@@ -169,21 +160,19 @@ class TelloControllerNode(Node):
             "\n Commands:" +
             "\n   T/L: Takeoff/Land     | ,/. : Dec/Inc Speed" +
             "\n   SPACE: Toggle Manual/Autonomous mode" +
-            "\n   S (in Auto): Toggle forward movement" +
+            "\n   X (in Auto): Toggle forward movement" +
             "\n   P or CTRL+C: Quit" +
             "\n" + "="*40)
+
 def main(args=None):
-    # ... (no changes)
     rclpy.init(args=args)
     with KeyboardReader() as key_reader:
         node = TelloControllerNode(key_reader)
-        try:
-            rclpy.spin(node)
-        except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
-            pass
-        finally:
-            node.destroy_node()
+        try: rclpy.spin(node)
+        except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException): pass
+        finally: node.destroy_node()
     rclpy.shutdown()
     print("\nTerminal settings restored.")
+
 if __name__ == '__main__':
     main()
